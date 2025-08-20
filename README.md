@@ -2,11 +2,18 @@
 
 ## Data Setup
 
-Run the download script to populate the `data/` directory before using any
-of the data-loading utilities:
+Run the download script to populate a directory with sample data before using
+any of the data-loading utilities. Pass an optional destination directory (the
+default is `~/Downloads`):
 
 ```bash
-./scripts/download_data.sh
+./scripts/download_data.sh [DEST_DIR]
+```
+
+For example:
+
+```bash
+./scripts/download_data.sh ~/Downloads
 ```
 
 `load_employee_data` searches for files named `Employee Information *.csv`.
