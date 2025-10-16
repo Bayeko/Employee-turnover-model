@@ -47,7 +47,7 @@ employee_information_2023.csv
 > The binary target is derived from `voluntary_termination_count` (`T` or `1` → terminated).
 
 Optional helper:
-```bash
+
 ./scripts/download_data.sh [DEST_DIR]   # default: ~/Downloads
 
 ⚙️ Installation
@@ -57,6 +57,7 @@ Python ≥ 3.9
 pip install numpy pandas scikit-learn matplotlib
 # or
 pip install -r requirements.txt
+
 
 
 Example requirements.txt:
