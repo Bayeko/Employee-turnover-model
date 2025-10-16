@@ -1,0 +1,827 @@
+# turnover_decisiontree_finalversion.py
+# Rank-constrained decision tree for turnover + m-estimate smoothing + isotonic calibration
+# Temporal outer CV (years) + inner repeated CV (3x5) + 1-SE rule
+# Final refit on 2019–2022, OOF isotonic calibration, and scoring on active 2023 cohort (to predict 2024)
+
+import sys
+import warnings
+import numpy as np
+import pandas as pd
+from pathlib import Path
+from io import StringIO
+from collections import Counter
+
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.impute import SimpleImputer
+from sklearn.preprocessing import OneHotEncoder
+from sklearn.model_selection import StratifiedKFold
+from sklearn.metrics import roc_auc_score
+from sklearn.isotonic import IsotonicRegression
+
+import matplotlib.pyplot as plt
+
+# ========= Settings =========
+DATA_PATH = Path().cwd()
+REQUIRED = [f"employee_information_{y}.csv" for y in range(2019, 2024)]
+
+# Inner-CV grids (kept compact + sensible)
+TRIAL_DEPTHS = [7, 8, 9]
+TRIAL_MIN_LEAFS = [40, 60, 80, 120]
+# m_shrink is tried relative to min_leaf: [min_leaf/2, min_leaf, 2*min_leaf]
+
+# Inner-CV: 3 x 5 folds (repeated CV)
+INNER_REPEATS = 3
+INNER_FOLDS = 5
+RANDOM_STATE = 42
+
+# Rank gating & preprocessing
+CUMULATIVE_RANKS = True
+MIN_COVERAGE_NUM = 0.05  # keep as numeric if >=5% numeric coverage
+
+# Fallback prior if mean(y) is invalid
+FALLBACK_PRIOR_MEAN = 0.0327
+
+# Output verbosity
+VERBOSE = False  # keep logs compact
+
+
+# ========= Utilities =========
+def verify_files():
+    missing = [f for f in REQUIRED if not (DATA_PATH / f).exists()]
+    if missing:
+        print("Missing files:", missing)
+        sys.exit(1)
+
+
+def drop_all_missing_columns(df: pd.DataFrame):
+    all_missing = [c for c in df.columns if df[c].isna().all()]
+    if all_missing:
+        df = df.drop(columns=all_missing)
+    return df, all_missing
+
+
+def load_data():
+    dfs = []
+    for y in range(2019, 2024):
+        df = pd.read_csv(DATA_PATH / f"employee_information_{y}.csv")
+        df.columns = df.columns.str.strip().str.lower().str.replace(' ', '_', regex=False)
+        df['record_date'] = pd.to_datetime(df['record_date'], errors='coerce')
+
+        # Proxies/fallbacks (column names vary in raw files)
+        df['tenure_company_ratio'] = df.get('tenure_group', np.nan)   # textual buckets
+        df['years_in_position'] = df.get('years_in_position', np.nan)
+        df['months_since_last_promotion'] = df.get('months_since_last_promotion', np.nan)
+        df['highest_performance_rating'] = df.get('latest_performance_rating', np.nan)
+
+        dfs.append(df)
+
+    emp = pd.concat(dfs, ignore_index=True)
+
+    # Binary target proxy from symbols
+    emp['voluntary_term'] = (
+        emp['voluntary_termination_count']
+        .astype(str).str.upper().str.strip()
+        .map({'T': 1, '1': 1}).fillna(0).astype(int)
+    )
+    return emp
+
+
+def prepare_train(emp):
+    """
+    Build (features at year t) -> target "left in t+1".
+    Keep last record per employee within a year.
+    """
+    parts = []
+    for year in range(2019, 2023):  # snapshots with known next-year label up to 2022
+        dfy = emp[emp.record_date.dt.year == year]
+        last = dfy.sort_values("record_date").groupby("unique_id").tail(1).set_index("unique_id")
+        nxt = emp[emp.record_date.dt.year == year + 1]
+        left_ids = set(nxt.loc[nxt.voluntary_term == 1, "unique_id"])
+        last["target"] = last.index.isin(left_ids).astype(int)
+        last["snapshot_year"] = year
+        parts.append(last.reset_index())
+    train = pd.concat(parts, ignore_index=True)
+    print("\nTarget distribution:\n", train.target.value_counts())
+    return train
+
+
+def prepare_pred(emp):
+    """
+    Score the 2023 cohort (end-of-year snapshot) to predict 2024 turnover risk.
+    """
+    df23 = emp[emp.record_date.dt.year == 2023]
+    last23 = df23.sort_values("record_date").groupby("unique_id").tail(1).set_index("unique_id")
+    print("\nRows to score (pre-filter):", last23.shape[0])
+    return last23
+
+
+# ========= Rank-constrained tree helpers =========
+def _weighted_entropy(y_node):
+    if len(y_node) == 0:
+        return 0.0
+    classes = np.unique(y_node)
+    if classes.size < 2:
+        return 0.0
+    counts = np.bincount(y_node, minlength=2)
+    n = len(y_node)
+    weights = n / (2 * counts + 1e-10)  # class balance
+    sample_weights = weights[y_node]
+    weighted_n = np.sum(sample_weights)
+    weighted_counts = np.bincount(y_node, weights=sample_weights, minlength=2)
+    p = weighted_counts / (weighted_n + 1e-12)
+    p = p[p > 0]
+    return float(-np.sum(p * np.log2(p)))
+
+
+def _allowed_cols_from_ranks(pre, rangs, depth, Xt_shape1):
+    feat_names = pre.get_feature_names_out()
+    rg = [g for g in rangs if len(g) > 0]
+    if not rg:
+        return list(range(Xt_shape1))
+
+    max_k = min(depth, len(rg) - 1)
+
+    def cols_for_up_to(k):
+        allowed_original = sorted(set(sum(rg[:(k + 1)], [])))
+        cols = []
+        for f in allowed_original:
+            for i, name in enumerate(feat_names):
+                parts = name.split('__')
+                if len(parts) == 2 and (parts[1] == f or parts[1].startswith(f + '_')):
+                    cols.append(i)
+        return sorted(set(cols))
+
+    cols = cols_for_up_to(max_k)
+    k = max_k
+    while not cols and k < len(rg) - 1:
+        k += 1
+        cols = cols_for_up_to(k)
+    if not cols:
+        return list(range(Xt_shape1))
+    return cols
+
+
+def build_node(Xt, y, idx, depth, rangs, pre, mu_prior,
+               max_depth, min_leaf, cumulative=True, m_shrink=None):
+    # default: shrink towards prior with strength m = min_leaf if not provided
+    if m_shrink is None:
+        m_shrink = float(min_leaf)
+
+    y_node = y[idx]
+    n_node = len(idx)
+    if n_node == 0:
+        return None
+
+    # Weighted impurity for split
+    counts = np.bincount(y_node, minlength=2)
+    n = n_node
+    weights = n / (2 * counts + 1e-10)
+    sample_weights = weights[y_node]
+    weighted_n = np.sum(sample_weights)
+    weighted_counts = np.bincount(y_node, weights=sample_weights, minlength=2)
+    _ = weighted_counts / (weighted_n + 1e-12)  # not directly used later
+    impurity = _weighted_entropy(y_node)
+
+    # Smoothed probability at this node (used if leaf)
+    raw_counts = np.bincount(y_node, minlength=2)
+    raw_total = int(raw_counts.sum())
+    raw_pos = int(raw_counts[1])
+    p_smooth = (raw_pos + m_shrink * mu_prior) / (raw_total + m_shrink) if raw_total > 0 else mu_prior
+
+    # Stop criteria
+    if depth >= max_depth or np.unique(y_node).size <= 1 or n_node < 2:
+        return {
+            'leaf': True,
+            'samples': int(n_node),
+            'impurity': float(impurity),
+            'value_smooth': np.array([1 - p_smooth, p_smooth]),
+        }
+
+    # Allowed columns by rank/gate
+    allowed_cols = _allowed_cols_from_ranks(pre, rangs, depth, Xt.shape[1])
+
+    # 1-split stump over allowed columns
+    Xt_node = Xt[idx][:, allowed_cols]
+    stump = DecisionTreeClassifier(
+        max_depth=1, class_weight="balanced", criterion="entropy", random_state=RANDOM_STATE
+    )
+    stump.fit(Xt_node, y_node)
+    t = stump.tree_
+
+    # No useful split → leaf
+    if t.feature[0] < 0:
+        return {
+            'leaf': True,
+            'samples': int(n_node),
+            'impurity': float(t.impurity[0]),
+            'value_smooth': np.array([1 - p_smooth, p_smooth]),
+        }
+
+    local_f = int(t.feature[0])
+    full_f = int(allowed_cols[local_f])
+    thr = float(t.threshold[0])
+
+    col = Xt[idx, full_f]
+    left_mask = col <= thr
+    left_idx = idx[left_mask]
+    right_idx = idx[~left_mask]
+
+    # Enforce min samples per leaf
+    if left_idx.size < min_leaf or right_idx.size < min_leaf:
+        return {
+            'leaf': True,
+            'samples': int(n_node),
+            'impurity': float(impurity),
+            'value_smooth': np.array([1 - p_smooth, p_smooth]),
+        }
+
+    node = {
+        'leaf': False,
+        'feature': full_f,
+        'threshold': thr,
+        'samples': int(n_node),
+        'impurity': float(t.impurity[0]),
+    }
+    node['left'] = build_node(Xt, y, left_idx, depth + 1, rangs, pre, mu_prior,
+                              max_depth, min_leaf, cumulative=True, m_shrink=m_shrink)
+    node['right'] = build_node(Xt, y, right_idx, depth + 1, rangs, pre, mu_prior,
+                               max_depth, min_leaf, cumulative=True, m_shrink=m_shrink)
+    return node
+
+
+def count_leaves(node):
+    if node is None:
+        return 0
+    if node.get('leaf', False):
+        return 1
+    return count_leaves(node['left']) + count_leaves(node['right'])
+
+
+def max_depth_reached(node):
+    if node is None:
+        return 0
+    if node.get('leaf', False):
+        return 1
+    return 1 + max(max_depth_reached(node['left']), max_depth_reached(node['right']))
+
+
+# ========= Preprocessor & ranks =========
+def make_preprocessor_and_ranks(X):
+    """
+    Business ordering with age_group accessible at depth 2:
+      0: tenure_company_ratio, years_in_position, months_since_last_promotion
+      1: hierarchy_level, is_people_manager
+      2: work_location, fte, age_group
+      3: highest_performance_rating, bravo_award, high_potential
+      4+: recruitment_source, five_dynamics_personality
+      (gender excluded)
+    """
+    priority = [
+        'tenure_company_ratio', 'years_in_position', 'months_since_last_promotion',  # depth 0
+        'hierarchy_level', 'is_people_manager',                                      # depth 1
+        'work_location', 'fte', 'age_group',                                         # depth 2
+        'highest_performance_rating', 'bravo_award', 'high_potential',               # depth 3
+        'recruitment_source', 'five_dynamics_personality',                           # depth 4+
+        # 'gender'  # excluded for submission
+    ]
+    cols = [c for c in priority if c in X.columns]
+    X = X.loc[:, cols].copy()
+
+    # Drop fully-missing columns
+    X, _ = drop_all_missing_columns(X)
+
+    # Detect numeric vs categorical + add missing flags for numerics
+    NUM_CANDIDATES = {'tenure_company_ratio', 'years_in_position', 'months_since_last_promotion',
+                      'highest_performance_rating', 'fte'}
+    num_cols, cat_cols, missing_flags = [], [], []
+    for c in list(X.columns):
+        if c in NUM_CANDIDATES:
+            s_raw = X[c]
+            s_num = pd.to_numeric(s_raw, errors='coerce')
+            num_count = int(s_num.notna().sum())
+            raw_non_na = int(s_raw.notna().sum())
+            if num_count == 0:
+                if raw_non_na > 0:
+                    X.loc[:, c] = s_raw.astype('object')
+                    cat_cols.append(c)
+                else:
+                    X = X.drop(columns=[c])
+            else:
+                coverage = float(num_count) / len(s_num)
+                if coverage >= MIN_COVERAGE_NUM:
+                    X.loc[:, c] = s_num
+                    num_cols.append(c)
+                    if s_num.isna().any():
+                        flag = f"{c}_is_missing"
+                        X.loc[:, flag] = s_num.isna().astype(int)
+                        num_cols.append(flag)
+                        missing_flags.append(flag)
+                else:
+                    if raw_non_na > 0:
+                        X.loc[:, c] = s_raw.astype('object')
+                        cat_cols.append(c)
+                    else:
+                        X = X.drop(columns=[c])
+        else:
+            X.loc[:, c] = X[c].astype('object')
+            cat_cols.append(c)
+
+    # Rank groups (gated by depth)
+    rangs = [
+        ['tenure_company_ratio', 'years_in_position', 'months_since_last_promotion'],  # depth 0
+        ['hierarchy_level', 'is_people_manager'],                                       # depth 1
+        ['work_location', 'fte', 'age_group'],                                          # depth 2
+        ['highest_performance_rating', 'bravo_award', 'high_potential'],                # depth 3
+        ['recruitment_source', 'five_dynamics_personality'],                            # depth 4+
+    ]
+
+    # Put *_is_missing flags in the same rank as their base numeric
+    flag_to_base = {f: f.replace('_is_missing', '') for f in missing_flags}
+    new_rangs = []
+    for grp in rangs:
+        new_grp = [f for f in grp if f in X.columns]
+        for flag, base in flag_to_base.items():
+            if base in grp and flag in X.columns:
+                new_grp.append(flag)
+        if new_grp:
+            new_rangs.append(new_grp)
+    rangs = new_rangs
+
+    # Append any remaining columns to the last rank
+    present = set(X.columns)
+    used = set(f for grp in rangs for f in grp)
+    remaining = [c for c in present if c not in used]
+    if remaining:
+        if not rangs:
+            rangs = [remaining]
+        else:
+            rangs[-1].extend(remaining)
+
+    pre = ColumnTransformer([
+        ("num", SimpleImputer(strategy='median'), num_cols),
+        ("cat", Pipeline([
+            ("impm", SimpleImputer(strategy="most_frequent")),
+            ("ohe", OneHotEncoder(handle_unknown="ignore", sparse_output=False, drop='first'))
+        ]), cat_cols),
+    ], remainder="drop")
+
+    return X, pre, rangs, num_cols, cat_cols, missing_flags
+
+
+def fit_constrained_tree(X, y, max_depth, min_leaf, m_shrink=None, pre=None, rangs=None):
+    # Build/fit preprocess if not provided
+    if pre is None or rangs is None:
+        Xp, pre, rangs, num_cols, cat_cols, _ = make_preprocessor_and_ranks(X.copy())
+    else:
+        Xp = X.copy()
+        num_cols = [t for t in pre.transformers_ if t[0] == "num"][0][2]
+        cat_cols = [t for t in pre.transformers_ if t[0] == "cat"][0][2]
+        for c in num_cols:
+            if c not in Xp.columns:
+                Xp.loc[:, c] = np.nan
+            else:
+                Xp.loc[:, c] = pd.to_numeric(Xp[c], errors='coerce')
+        for c in cat_cols:
+            if c not in Xp.columns:
+                Xp.loc[:, c] = np.nan
+            else:
+                Xp.loc[:, c] = Xp[c].astype('object')
+
+    Xt = pre.fit_transform(Xp)
+
+    mu_prior = float(np.mean(y)) if len(y) > 0 else FALLBACK_PRIOR_MEAN
+    if not np.isfinite(mu_prior) or not (0 < mu_prior < 1):
+        mu_prior = FALLBACK_PRIOR_MEAN
+
+    idx = np.arange(Xt.shape[0])
+    tree = build_node(
+        Xt, np.array(y), idx, 0, rangs, pre, mu_prior,
+        max_depth=max_depth, min_leaf=min_leaf, cumulative=True,
+        m_shrink=(float(min_leaf) if m_shrink is None else float(m_shrink))
+    )
+    return tree, pre, rangs, num_cols, cat_cols
+
+
+# ========= Traversal & Outputs =========
+def traverse(node, x_row):
+    if node is None or node.get('leaf', False):
+        if node is None:
+            return np.array([1.0, 0.0])
+        return node['value_smooth']
+    if x_row[node['feature']] <= node['threshold']:
+        return traverse(node['left'], x_row)
+    else:
+        return traverse(node['right'], x_row)
+
+
+def print_tree(node, feature_names, depth=0, class_names=["Stay", "Leave"]):
+    if node is None:
+        return
+    indent = "  " * depth
+    if node['leaf']:
+        ps = node['value_smooth'][1]
+        print(f"{indent}class: {class_names[int(ps >= 0.5)]}, samples: {node['samples']}, p_smooth={ps:.4f}")
+    else:
+        fname = feature_names[node['feature']]
+        print(f"{indent}{fname} @ {node['threshold']:.6f} | samples={node['samples']}")
+        print(f"{indent}left:")
+        print_tree(node['left'], feature_names, depth + 1, class_names)
+        print(f"{indent}right:")
+        print_tree(node['right'], feature_names, depth + 1, class_names)
+
+
+def save_tree_text(custom_tree, pre, title="decision_tree_readable.txt"):
+    feature_names = pre.get_feature_names_out()
+    out = StringIO()
+    old = sys.stdout
+    sys.stdout = out
+    print_tree(custom_tree, feature_names)
+    sys.stdout = old
+    with open(title, 'w', encoding='utf-8') as f:
+        f.write(out.getvalue())
+    print(f"\nSaved → {title}")
+
+
+def plot_turnover_distribution(scores):
+    plt.figure(figsize=(10, 6))
+    plt.hist(scores, bins=50, edgecolor='black')
+    plt.title('Distribution of Individual Turnover Probabilities')
+    plt.xlabel('Turnover Probability')
+    plt.ylabel('Number of Employees')
+    plt.grid(True, alpha=0.3)
+    plt.savefig("turnover_probability_distribution.png", dpi=150)
+    plt.close()
+    print("Saved → turnover_probability_distribution.png")
+
+
+# ========= Group RMSE (site averages) =========
+def rmse_grouped(y_true, y_prob, groups, weighted=False):
+    df = pd.DataFrame({'y': y_true, 'p': y_prob, 'g': groups})
+    agg = df.groupby('g').agg(y_mean=('y', 'mean'), p_mean=('p', 'mean'), n=('y', 'size'))
+    se = (agg['p_mean'] - agg['y_mean']) ** 2
+    if weighted:
+        w = agg['n'] / agg['n'].sum()
+        return float(np.sqrt((se * w).sum()))
+    else:
+        return float(np.sqrt(se.mean()))
+
+
+# ========= Inner CV (3x5) with 1-SE rule =========
+def evaluate_config_inner_cv(X_train, y_train, depth, min_leaf, m_shrink):
+    """
+    Returns mean AUC and std over (INNER_REPEATS * INNER_FOLDS) folds.
+    Each fold fits its own preprocessor + constrained tree on the training split.
+    """
+    aucs = []
+    for rep in range(INNER_REPEATS):
+        cv = StratifiedKFold(n_splits=INNER_FOLDS, shuffle=True, random_state=RANDOM_STATE + rep)
+        for tr, va in cv.split(X_train, y_train):
+            Xtr, Xva = X_train.iloc[tr].copy(), X_train.iloc[va].copy()
+            ytr, yva = y_train.iloc[tr].values, y_train.iloc[va].values
+
+            # Fit preprocess + constrained tree on inner training split
+            Xtr_p, pre_f, rangs_f, _, _, _ = make_preprocessor_and_ranks(Xtr)
+            Xt_tr = pre_f.fit_transform(Xtr_p)
+            mu_prior = float(np.mean(ytr))
+            if not np.isfinite(mu_prior) or not (0 < mu_prior < 1):
+                mu_prior = FALLBACK_PRIOR_MEAN
+            tree_f = build_node(
+                Xt_tr, ytr, np.arange(Xt_tr.shape[0]), 0, rangs_f, pre_f, mu_prior,
+                max_depth=depth, min_leaf=min_leaf, cumulative=True, m_shrink=m_shrink
+            )
+
+            # Align validation and score
+            Xva_p = Xva.copy()
+            num_cols = [t for t in pre_f.transformers_ if t[0] == "num"][0][2]
+            cat_cols = [t for t in pre_f.transformers_ if t[0] == "cat"][0][2]
+            for c in num_cols:
+                if c not in Xva_p.columns:
+                    Xva_p.loc[:, c] = np.nan
+                else:
+                    Xva_p.loc[:, c] = pd.to_numeric(Xva_p[c], errors='coerce')
+            for c in cat_cols:
+                if c not in Xva_p.columns:
+                    Xva_p.loc[:, c] = np.nan
+                else:
+                    Xva_p.loc[:, c] = Xva_p[c].astype('object')
+            Xt_va = pre_f.transform(Xva_p)
+
+            def traverse_local(node, x_row):
+                if node is None or node.get('leaf', False):
+                    if node is None:
+                        return np.array([1.0, 0.0])
+                    return node['value_smooth']
+                if x_row[node['feature']] <= node['threshold']:
+                    return traverse_local(node['left'], x_row)
+                else:
+                    return traverse_local(node['right'], x_row)
+
+            proba_va = np.array([traverse_local(tree_f, row)[1] for row in Xt_va])
+            aucs.append(roc_auc_score(yva, proba_va))
+
+    return float(np.mean(aucs)), float(np.std(aucs)), len(aucs)  # mean, std, N
+
+
+def one_se_selection(results):
+    """
+    results: list of dicts with keys:
+      - 'depth', 'min_leaf', 'm_shrink', 'auc_mean', 'auc_std', 'n'
+    Apply 1-SE rule: pick simplest among configs with mean ≥ (best_mean - SE_best),
+    where SE_best = best_std / sqrt(n_best).
+    Simplicity order: smaller depth, larger min_leaf, larger m_shrink.
+    """
+    best = max(results, key=lambda r: r['auc_mean'])
+    se_best = best['auc_std'] / np.sqrt(best['n'])
+    threshold = best['auc_mean'] - se_best
+
+    cands = [r for r in results if r['auc_mean'] >= threshold]
+    cands.sort(key=lambda r: (r['depth'], -r['min_leaf'], -r['m_shrink']))
+    return cands[0]
+
+
+# ========= OOF isotonic calibration =========
+def fit_isotonic_calibrator_oof(X_tr, y_tr, depth, min_leaf, m_shrink):
+    """
+    Build OOF probabilities on X_tr with fixed hyperparams (depth/min_leaf/m_shrink),
+    then fit an isotonic regression calibrator. No leakage to outer test.
+    """
+    oof = np.zeros(len(X_tr), dtype=float)
+    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=RANDOM_STATE)
+    for tr_idx, va_idx in cv.split(X_tr, y_tr):
+        Xtr_fold = X_tr.iloc[tr_idx].copy()
+        ytr_fold = y_tr.iloc[tr_idx].values
+        Xva_fold = X_tr.iloc[va_idx].copy()
+
+        # Fit fold model
+        tree_f, pre_f, rangs_f, _, _ = fit_constrained_tree(
+            Xtr_fold, y_tr.iloc[tr_idx],
+            max_depth=depth, min_leaf=min_leaf, m_shrink=m_shrink
+        )
+
+        # Predict on fold validation
+        num_cols = [t for t in pre_f.transformers_ if t[0] == "num"][0][2]
+        cat_cols = [t for t in pre_f.transformers_ if t[0] == "cat"][0][2]
+        for c in num_cols:
+            if c not in Xva_fold.columns:
+                Xva_fold.loc[:, c] = np.nan
+            else:
+                Xva_fold.loc[:, c] = pd.to_numeric(Xva_fold[c], errors='coerce')
+        for c in cat_cols:
+            if c not in Xva_fold.columns:
+                Xva_fold.loc[:, c] = np.nan
+            else:
+                Xva_fold.loc[:, c] = Xva_fold[c].astype('object')
+        Xt_va = pre_f.transform(Xva_fold)
+        oof[va_idx] = np.array([traverse(tree_f, row)[1] for row in Xt_va])
+
+    # Fit isotonic calibrator on OOF predictions
+    iso = IsotonicRegression(out_of_bounds="clip")
+    iso.fit(oof, y_tr.values)
+    return iso
+
+
+# ========= Temporal outer CV (years) =========
+def outer_temporal_cv(train_df):
+    """
+    Outer test years: 2020, 2021, 2022
+    Train: all snapshot_year <= test_year - 1
+    Inner: 3x5 repeated CV on the outer-train set to select (depth, min_leaf, m_shrink) with 1-SE.
+    After selecting hyperparams, fit isotonic calibrator on OOF preds of outer-train.
+    Evaluate on the outer test with calibrated probabilities:
+      - AUC (individual)
+      - RMSE of per-location predicted averages (both unweighted and weighted)
+    """
+    outer_years = [2020, 2021, 2022]
+    outer_scores = []  # list of dicts with metrics and chosen params
+    chosen_params_list = []
+
+    for test_year in outer_years:
+        train_years = list(range(2019, test_year))
+        df_tr = train_df[train_df['snapshot_year'].isin(train_years)].copy()
+        df_te = train_df[train_df['snapshot_year'] == test_year].copy()  # <- fixed
+
+        X_tr = df_tr.drop(columns=["unique_id", "record_date", "voluntary_termination_count",
+                                   "voluntary_term", "target", "snapshot_year",
+                                   "first_name", "last_name", "job_code"], errors="ignore")
+        y_tr = df_tr['target']
+        X_te = df_te.drop(columns=["unique_id", "record_date", "voluntary_termination_count",
+                                   "voluntary_term", "target", "snapshot_year",
+                                   "first_name", "last_name", "job_code"], errors="ignore")
+        y_te = df_te['target']
+
+        # Inner grid search with 1-SE
+        results = []
+        for d in TRIAL_DEPTHS:
+            for ml in TRIAL_MIN_LEAFS:
+                m_list = sorted({max(1, int(ml // 2)), int(ml), int(ml * 2)})
+                for ms in m_list:
+                    mean_auc, std_auc, n = evaluate_config_inner_cv(X_tr, y_tr, d, ml, ms)
+                    results.append({
+                        'depth': d, 'min_leaf': ml, 'm_shrink': ms,
+                        'auc_mean': mean_auc, 'auc_std': std_auc, 'n': n
+                    })
+
+        chosen = one_se_selection(results)
+        chosen_params_list.append(dict(chosen))
+
+        # Refit model on all outer-train with chosen params
+        tree, pre, rangs, _, _ = fit_constrained_tree(
+            X_tr, y_tr,
+            max_depth=chosen['depth'],
+            min_leaf=chosen['min_leaf'],
+            m_shrink=chosen['m_shrink']
+        )
+
+        # Fit isotonic calibrator on outer-train OOF with chosen params (no leakage)
+        iso = fit_isotonic_calibrator_oof(X_tr, y_tr,
+                                          depth=chosen['depth'],
+                                          min_leaf=chosen['min_leaf'],
+                                          m_shrink=chosen['m_shrink'])
+
+        # Score on outer test year (calibrated)
+        # Align X_te to pre
+        num_cols = [t for t in pre.transformers_ if t[0] == "num"][0][2]
+        cat_cols = [t for t in pre.transformers_ if t[0] == "cat"][0][2]
+        X_te_aligned = X_te.copy()
+        for c in num_cols:
+            if c not in X_te_aligned.columns:
+                X_te_aligned.loc[:, c] = np.nan
+            else:
+                X_te_aligned.loc[:, c] = pd.to_numeric(X_te_aligned[c], errors='coerce')
+        for c in cat_cols:
+            if c not in X_te_aligned.columns:
+                X_te_aligned.loc[:, c] = np.nan
+            else:
+                X_te_aligned.loc[:, c] = X_te_aligned[c].astype('object')
+        Xt_te = pre.transform(X_te_aligned)
+        raw_probs_te = np.array([traverse(tree, row)[1] for row in Xt_te])
+        cal_probs_te = np.clip(iso.predict(raw_probs_te), 0.0, 1.0)
+
+        auc_te = roc_auc_score(y_te, cal_probs_te)
+        if 'work_location' in df_te.columns:
+            rmse_unw = rmse_grouped(y_te.values, cal_probs_te, df_te['work_location'], weighted=False)
+            rmse_w = rmse_grouped(y_te.values, cal_probs_te, df_te['work_location'], weighted=True)
+        else:
+            rmse_unw = np.nan
+            rmse_w = np.nan
+
+        outer_scores.append({
+            'test_year': test_year,
+            'AUC': auc_te,
+            'RMSE_unweighted': rmse_unw,
+            'RMSE_weighted': rmse_w,
+            'chosen_depth': chosen['depth'],
+            'chosen_min_leaf': chosen['min_leaf'],
+            'chosen_m_shrink': chosen['m_shrink']
+        })
+
+        print(f"Outer {test_year}: train_years={train_years}, "
+              f"chosen(depth={chosen['depth']}, min_leaf={chosen['min_leaf']}, m_shrink={chosen['m_shrink']}) "
+              f"→ AUC={auc_te:.4f}, RMSE(unw)={rmse_unw:.4f}, RMSE(w)={rmse_w:.4f}")
+
+    # Summary
+    aucs = [r['AUC'] for r in outer_scores]
+    rmses_unw = [r['RMSE_unweighted'] for r in outer_scores if not np.isnan(r['RMSE_unweighted'])]
+    rmses_w = [r['RMSE_weighted'] for r in outer_scores if not np.isnan(r['RMSE_weighted'])]
+    print(f"\nOuter-CV AUC (2020/2021/2022): {np.mean(aucs):.4f} ± {np.std(aucs):.4f}")
+    if len(rmses_unw) > 0:
+        print(f"Outer-CV RMSE per location (unweighted): {np.mean(rmses_unw):.4f} ± {np.std(rmses_unw):.4f}")
+        print(f"Outer-CV RMSE per location (weighted)  : {np.mean(rmses_w):.4f} ± {np.std(rmses_w):.4f}")
+
+    return outer_scores, chosen_params_list
+
+
+def aggregate_params(chosen_params_list):
+    """
+    Majority vote across outer folds; tie-breakers:
+      - smaller depth, then larger min_leaf, then larger m_shrink.
+    """
+    depths = [p['depth'] for p in chosen_params_list]
+    minleafs = [p['min_leaf'] for p in chosen_params_list]
+    mshrinks = [p['m_shrink'] for p in chosen_params_list]
+
+    def mode_or_tiebreak(vals, prefer_small=False, prefer_large=False):
+        cnt = Counter(vals)
+        mc = cnt.most_common()
+        top_count = mc[0][1]
+        tops = [v for v, c in mc if c == top_count]
+        if len(tops) == 1:
+            return tops[0]
+        if prefer_small:
+            return min(tops)
+        if prefer_large:
+            return max(tops)
+        return tops[0]
+
+    depth_final = mode_or_tiebreak(depths, prefer_small=True)
+    minleaf_final = mode_or_tiebreak(minleafs, prefer_large=True)
+    m_final = mode_or_tiebreak(mshrinks, prefer_large=True)
+
+    print(f"\nAggregated params (vote): depth={depth_final}, min_leaf={minleaf_final}, m_shrink={m_final}")
+    return int(depth_final), int(minleaf_final), int(m_final)
+
+
+# ========= Main =========
+def main():
+    try:
+        warnings.filterwarnings("ignore")
+        verify_files()
+
+        emp = load_data()
+        train_df = prepare_train(emp)
+
+        # ---- Temporal outer CV with inner repeated CV + 1-SE + isotonic calibration ----
+        outer_scores, chosen_params_list = outer_temporal_cv(train_df)
+
+        # ---- Aggregate hyperparams & final refit on all 2019–2022 ----
+        X_all = train_df.drop(columns=["unique_id", "record_date", "voluntary_termination_count",
+                                       "voluntary_term", "target", "snapshot_year",
+                                       "first_name", "last_name", "job_code"], errors="ignore")
+        y_all = train_df['target']
+
+        depth_final, minleaf_final, m_final = aggregate_params(chosen_params_list)
+
+        # Fit final model on all 2019–2022
+        tree, pre, rangs, _, _ = fit_constrained_tree(
+            X_all, y_all, max_depth=depth_final, min_leaf=minleaf_final, m_shrink=m_final
+        )
+        leaves = count_leaves(tree)
+        depth_used = max_depth_reached(tree)
+        print(f"Final model (all 2019–2022) → depth={depth_final}, min_leaf={minleaf_final}, "
+              f"m_shrink={m_final}, leaves={leaves}, max_depth_reached={depth_used}")
+        save_tree_text(tree, pre, title="decision_tree_readable.txt")
+
+        # Fit final isotonic calibrator with OOF on 2019–2022 (no leakage to 2023)
+        iso_final = fit_isotonic_calibrator_oof(X_all, y_all,
+                                                depth=depth_final,
+                                                min_leaf=minleaf_final,
+                                                m_shrink=m_final)
+        print("Fitted final isotonic calibrator on OOF (2019–2022).")
+
+        # ---- Score 2023 cohort (predict 2024) ----
+        pred = prepare_pred(emp)
+
+        # Keep only ACTIVE employees in the 2023 snapshot:
+        # voluntary_termination_count == 0 (robust to symbols/strings like 'T'/'1')
+        term_flag = (
+            pred['voluntary_termination_count']
+            .astype(str).str.upper().str.strip()
+            .map({'T': 1, '1': 1})  # treat 'T' or '1' as terminated
+            .fillna(0).astype(int)
+        )
+        pred = pred[term_flag == 0].copy()
+        print("\nActive rows to score:", pred.shape[0])
+
+        drop_cols_pred = ["record_date", "voluntary_termination_count", "voluntary_term",
+                          "first_name", "last_name", "job_code"]
+        Xp = pred.drop(columns=drop_cols_pred, errors="ignore").copy()
+
+        # Align to learned preprocessor
+        num_cols = [t for t in pre.transformers_ if t[0] == "num"][0][2]
+        cat_cols = [t for t in pre.transformers_ if t[0] == "cat"][0][2]
+        for c in num_cols:
+            if c not in Xp.columns:
+                Xp.loc[:, c] = np.nan
+            else:
+                Xp.loc[:, c] = pd.to_numeric(Xp[c], errors='coerce')
+        for c in cat_cols:
+            if c not in Xp.columns:
+                Xp.loc[:, c] = np.nan
+            else:
+                Xp.loc[:, c] = Xp[c].astype('object')
+
+        Xt_pred = pre.transform(Xp)
+        raw_scores = np.array([traverse(tree, row)[1] for row in Xt_pred])
+        scores = np.clip(iso_final.predict(raw_scores), 0.0, 1.0)  # calibrated probs
+
+        # ---- Save outputs (ACTIVE ONLY) ----
+        plot_turnover_distribution(scores)
+
+        out = pd.DataFrame({"unique_id": Xp.index, "turnover_probability": scores})
+        out = out.sort_values(by="turnover_probability", ascending=False)
+        out.to_csv("individual_turnover_probabilities_sorted.csv", index=False)
+        print("Saved → individual_turnover_probabilities_sorted.csv")
+
+        pred_with_loc = pred.copy()
+        pred_with_loc['turnover_probability'] = scores
+        if 'work_location' in pred_with_loc.columns:
+            avg_turnover = pred_with_loc.groupby('work_location')['turnover_probability'].mean().reset_index()
+            avg_turnover['predicted_avg_turnover_rate'] = avg_turnover['turnover_probability'] * 100.0
+            avg_turnover = avg_turnover.sort_values(by="predicted_avg_turnover_rate", ascending=False)
+            avg_turnover[['work_location', 'predicted_avg_turnover_rate']].to_csv(
+                "avg_turnover_by_location_sorted.csv", index=False
+            )
+            print("Saved → avg_turnover_by_location_sorted.csv")
+        else:
+            print("Column 'work_location' not found; skipped location averages CSV.")
+
+    except KeyboardInterrupt:
+        print("\nExecution interrupted by user.")
+    except Exception as e:
+        print(f"\nAn error occurred: {str(e)}")
+
+
+if __name__ == "__main__":
+    main()
