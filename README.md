@@ -1,18 +1,24 @@
-Zonla Turnover — Final Model
+Employee Turnover Prediction — Final Model
 
-Rank-constrained decision tree with m-estimate smoothing and out-of-fold (OOF) isotonic calibration.
-Temporal outer CV across years (2019→2022 train, test on 2020/2021/2022), inner repeated CV (3×5) with 1-SE rule, final refit on 2019–2022 and scoring the active 2023 cohort (to predict 2024).
+Rank-constrained decision tree with m-estimate smoothing and out-of-fold isotonic calibration.
+Implements temporal outer cross-validation (year-based) with inner repeated CV (3×5) and the 1-SE rule for model selection.
+Final refit on 2019–2022 data and scoring of the active 2023 cohort to predict 2024 voluntary turnover.
 
-1) Project Structure
+
+
+
+
+
+Project Structure
 .
-├─ turnover_decisiontree_finalversion.py   # main script (training, CV, final scoring)
+├─ turnover_decisiontree_finalversion.py   # main script (training, CV, scoring)
 ├─ scripts/
-│  └─ download_data.sh                     # optional helper to fetch sample data
-└─ data/                                   # (optional) put CSVs here or in CWD
+│  └─ download_data.sh                     # optional data helper
+└─ data/                                   # optional folder for CSVs
 
-2) Data Requirements
+Data Requirements
 
-Provide yearly snapshots with these exact filenames (current working directory or data/):
+The model expects five yearly CSV snapshots:
 
 employee_information_2019.csv
 employee_information_2020.csv
@@ -21,115 +27,115 @@ employee_information_2022.csv
 employee_information_2023.csv
 
 
-Minimum expected fields (case/space tolerant — the script normalizes headers):
-unique_id, record_date, work_location, voluntary_termination_count plus HR attributes used as features:
-tenure_group/tenure_company_ratio, years_in_position, months_since_last_promotion,
-hierarchy_level, is_people_manager, fte, age_group,
-highest_performance_rating, bravo_award, high_potential,
-recruitment_source, five_dynamics_personality.
+Expected columns (case and space insensitive):
 
-Notes
-• The code auto-detecte numérique vs. catégoriel et crée des flags “*_is_missing” pour les numériques.
-• gender est exclu par design pour la soumission.
-• La cible “leave in t+1” est dérivée via appariement t→t+1 et un proxy voluntary_term (map de voluntary_termination_count).
+Category	Examples
+Identifiers	unique_id, record_date, work_location, voluntary_termination_count
+Tenure & Mobility	tenure_group / tenure_company_ratio, years_in_position, months_since_last_promotion
+Structure	hierarchy_level, is_people_manager, fte, age_group
+Performance	highest_performance_rating / latest_performance_rating, bravo_award, high_potential
+Talent / Traits	recruitment_source, five_dynamics_personality
 
-Optional: download helper
+gender is excluded by design.
+Missing values are imputed, and numeric columns receive an additional _is_missing flag.
+The binary target is derived from voluntary_termination_count (T or 1 → terminated).
+
+Optional helper:
+
 ./scripts/download_data.sh [DEST_DIR]   # default: ~/Downloads
 
-
-Sinon, copie manuelle des employee_information_*.csv dans le répertoire du script ou ./data.
-
-3) How to Run
-# Option A: depuis le dossier contenant les CSV
-python turnover_decisiontree_finalversion.py
-
-# Option B: si tes CSV sont dans ./data, lance depuis le repo racine
-(cd data && python ../turnover_decisiontree_finalversion.py)
-
-Python & deps
+Installation
 
 Python ≥ 3.9
+Install dependencies:
 
-numpy, pandas, scikit-learn, matplotlib
-
-Instal rapide :
-
-pip install -r requirements.txt
-# ou
 pip install numpy pandas scikit-learn matplotlib
+# or
+pip install -r requirements.txt
 
-4) What the script does
 
-Verify & load employee_information_2019..2023.csv
+Example requirements.txt
 
-Build labels: pour chaque employé, dernier enregistrement de l’année t → cible = a quitté volontairement en t+1.
+numpy>=1.24
+pandas>=2.0
+scikit-learn>=1.3
+matplotlib>=3.7
 
-Preprocess: imputation (median/most_frequent), One-Hot (drop='first'), rangs métiers (features “débloquées” selon la profondeur).
+How to Run
 
-Model: arbre contraint par rang + m-estimate smoothing au niveau des feuilles.
+Run from the folder containing your CSV files:
 
-Model selection: inner CV 3×5, grille compacte (max_depth ∈ {7,8,9}, min_leaf ∈ {40,60,80,120}, m_shrink ∈ {min_leaf/2, min_leaf, 2*min_leaf}), règle 1-SE.
+python turnover_decisiontree_finalversion.py
 
-Outer temporal CV: test 2020/2021/2022 (train ≤ année-1).
 
-Métriques: AUC individuel, RMSE des moyennes prédites par site (pondéré & non-pondéré).
+If the files are in ./data:
 
-OOF isotonic calibration sur l’ensemble d’entraînement outer (zéro fuite).
+(cd data && python ../turnover_decisiontree_finalversion.py)
 
-Final refit: sur 2019–2022 avec params agrégés (vote), OOF iso calibrator refitté.
+Model Overview
 
-Predict 2023 active (exclut ceux déjà terminés en 2023) → risque 2024.
+Verify & load yearly data.
 
-Save artifacts.
+Build targets: last record per employee per year → label “1” if voluntarily left in t + 1.
 
-5) Outputs
+Preprocess: median/mode imputation, One-Hot encoding, and rank-based feature gating.
 
-decision_tree_readable.txt — impression textuelle de l’arbre final (features transformées).
+Model: decision tree with rank constraints and m-estimate smoothing at leaves.
 
-turnover_probability_distribution.png — histogramme des probabilités individuelles.
+Inner CV (3×5): grid search
 
-individual_turnover_probabilities_sorted.csv — (unique_id, turnover_probability), trié décroissant.
+max_depth ∈ {7, 8, 9}
 
-avg_turnover_by_location_sorted.csv — (work_location, predicted_avg_turnover_rate) en %.
+min_leaf ∈ {40, 60, 80, 120}
 
-6) Results (Lonza 2025 Challenge)
+m_shrink ∈ {½·min_leaf, min_leaf, 2·min_leaf}
+→ pick simplest model within one SE of best mean AUC.
 
-Q1 — Average turnover by location (2024)
+Temporal outer CV: train ≤ year − 1, test on {2020, 2021, 2022}; evaluate AUC + site-level RMSE.
 
-RMSE: 0.089
+Isotonic calibration: fitted out-of-fold (no leakage).
 
-Rank: 19 / 31
+Final refit: on 2019–2022 using aggregated parameters (voting).
 
-(Référence: médiane 0.077, meilleur 0.053)
+Predict 2023 active employees (excluding already terminated) → 2024 turnover risk.
 
-Q2 — Individual voluntary turnover probability (2024)
+Export results.
 
-AUC: 0.679
+Outputs
+File	Description
+decision_tree_readable.txt	Text representation of the final tree
+turnover_probability_distribution.png	Histogram of predicted probabilities
+individual_turnover_probabilities_sorted.csv	Sorted employee-level probabilities
+avg_turnover_by_location_sorted.csv	Average predicted turnover per site (%)
+Example Results (demonstration)
+Task	Metric	Example Score	Comment
+Predict average turnover by location	RMSE	0.089	Lower = better
+Predict individual voluntary turnover	AUC	0.679	0.5 = random · 1.0 = perfect
 
-Rank: 12 / 22
+(These are example benchmark results for illustration — actual scores depend on data.)
 
-(Référence: aléatoire 0.5, meilleur 0.792)
+Modeling Notes
 
-Les courbes ROC et détails officiels proviennent de l’évaluation du challenge interne (Erwan & Maike, session du 8 oct).
+Rank gating: progressively unlocks feature groups by tree depth
+(tenure → hierarchy → site → performance → recruitment).
 
-7) Modeling Notes
+m-estimate smoothing: Bayesian leaf regularization toward the global mean.
 
-Rank gating (ordre métier) pour encourager des splits interprétables:
-0) tenure/ancienneté & mouvement, 1) niveau hiérarchie & people manager,
-2) site & FTE & âge, 3) performance & bravo/high-potential, 4+) recrutement & personnalité.
+Out-of-Fold isotonic calibration: monotonic probability correction without data leakage.
 
-m-estimate: lissage bayésien des feuilles (prior = moyenne d’entraînement, force liée à min_leaf).
+1-SE rule: prefers the simplest model within one standard error of the best mean AUC.
 
-Isotonic OOF: calibration monotone en dehors de l’échantillon d’entraînement pour des probabilités mieux calibrées.
+Troubleshooting
 
-1-SE rule: privilégie le modèle plus simple dont la perf est dans l’intervalle d’une erreur standard du meilleur.
+Missing files → script stops and lists required filenames.
 
-8) Repro & Troubleshooting
+Missing columns → safely ignored; complete data improves accuracy.
 
-Fichiers manquants → le script s’arrête et liste ceux à fournir.
+Small performance differences may appear across scikit-learn versions.
 
-Colonnes absentes → elles sont ignorées; garde la nomenclature indiquée plus haut pour maximiser l’info.
+If work_location is missing, site-level averages will be skipped.
 
-Versions: fixe RANDOM_STATE=42; des diffs mineurs peuvent subsister selon versions libs.
+Random seed fixed at RANDOM_STATE = 42.
 
-Sites non présents en 2023 → pas de moyenne par site créée.
+⚠️ gender is intentionally excluded for fairness.
+Always ensure proper data governance and privacy compliance before applying this model.
